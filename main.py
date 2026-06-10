@@ -3,6 +3,7 @@ import os
 import asyncio
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
+from services import telegram_services, gemini_service, matcher_service, sheets_service
 
 load_dotenv()
 
@@ -42,11 +43,26 @@ async def recibir_webhook(request: Request):
         
         if accion_boton == "confirmar_si":
             datos = usuario["datos_pendientes"]
-            # Aquí mañana conectaremos con sheets_service
-            await telegram_services.enviar_mensaje_simple(chat_id, f"🚀 *¡Confirmado!* Próximo paso: Guardar en Sheets a {datos['entidad']}")
+            
+            # Avisamos que estamos guardando
+            await telegram_services.responder_callback(callback_id, "Guardando en Google Sheets...")
+            await telegram_services.quitar_botones(chat_id, message_id)
+            
+            # Si el cliente fue encontrado, llamamos al archivista
+            if datos.get("empresa") != "DESCONOCIDA":
+                exito = await sheets_service.actualizar_status_cliente(
+                    empresa=datos["empresa"],
+                    cliente_oficial=datos["entidad"],
+                    nueva_accion=datos["accion"],
+                    fecha_formato=datos["fecha"]
+                )
+                await telegram_services.enviar_mensaje_simple(chat_id, f"✅ *¡Guardado exitosamente!*\nSe actualizó la columna Status de *{datos['entidad']}* en la planilla de _{datos['empresa']}_.")
+            else:
+                await telegram_services.enviar_mensaje_simple(chat_id, f"⚠️ *Atención:* El recordatorio fue procesado, pero no se guardó en Google Sheets porque el cliente no existe en KEMIN ni CORLASA.")
+            
             usuario["estado"] = "IDLE"
             usuario["datos_pendientes"] = None
-            usuario["chat_ia"] = None # Limpiamos la memoria de la IA
+            usuario["chat_ia"] = None
             
         elif accion_boton == "confirmar_no":
             await telegram_services.enviar_mensaje_simple(chat_id, "❌ *Operación Cancelada.*")
@@ -101,6 +117,18 @@ async def recibir_webhook(request: Request):
                 )
             
             datos_corregidos["origen"] = "Gemini Flash (Corregido)"
+
+            # ¡ACÁ CORREGIMOS EL BUG! Usamos datos_corregidos en lugar de datos_iniciales
+            resultado_match = matcher_service.cruzar_con_cartera(datos_corregidos["entidad"])
+            
+            if resultado_match["encontrado"]:
+                datos_corregidos["entidad"] = resultado_match["cliente_oficial"]
+                datos_corregidos["empresa"] = resultado_match["empresa_representada"]
+                datos_corregidos["origen"] += f"\n✅ Match: {resultado_match['empresa_representada']} ({resultado_match['porcentaje_confianza']}%)"
+            else:
+                datos_corregidos["origen"] += f"\n⚠️ No se encontró el cliente en la base de datos."
+                datos_corregidos["empresa"] = "DESCONOCIDA"
+
             usuario["datos_pendientes"] = datos_corregidos
             usuario["chat_ia"] = chat_actualizado
             usuario["estado"] = "AWAITING_CONFIRMATION" 
@@ -124,6 +152,20 @@ async def recibir_webhook(request: Request):
                     )
                 
                 datos_iniciales["origen"] = "Gemini Flash (Turno 1)"
+
+                # ¡ACÁ OCURRE LA MAGIA DEL MATCHING!
+                resultado_match = matcher_service.cruzar_con_cartera(datos_iniciales["entidad"])
+                
+                if resultado_match["encontrado"]:
+                    # Pisamos el nombre que entendió la IA con el nombre oficial de la base de datos
+                    datos_iniciales["entidad"] = resultado_match["cliente_oficial"]
+                    datos_iniciales["empresa"] = resultado_match["empresa_representada"]
+                    
+                    # Le agregamos un cartelito al resumen para que el usuario vea la magia
+                    datos_iniciales["origen"] += f"\n✅ Match: {resultado_match['empresa_representada']} ({resultado_match['porcentaje_confianza']}%)"
+                else:
+                    datos_iniciales["origen"] += f"\n⚠️ No se encontró el cliente en la base de datos."
+                    datos_iniciales["empresa"] = "DESCONOCIDA"
                 
                 # Guardamos los datos y la memoria temporal del chat en nuestra máquina de estados
                 usuario["datos_pendientes"] = datos_iniciales
